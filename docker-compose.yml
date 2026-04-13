@@ -1,0 +1,47 @@
+# docker-compose.yml for mcp-flights
+# Deploy: Portainer → Stacks → Add from Repository → GitOps polling
+# CI/CD: GitHub Actions builds image on push, updates this tag automatically
+
+services:
+  mcp-flights:
+    image: ghcr.io/nsoult-agentic/mcp-flights:latest
+    container_name: mcp-flights
+    restart: unless-stopped
+
+    # ── Network ──
+    ports:
+      - "127.0.0.1:8907:8907"
+
+    # ── Security Hardening ──
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+    # ── Resource Limits ──
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+          cpus: "1.0"
+
+    # ── Filesystem ──
+    volumes:
+      - /srv/mcp-flights/secrets:/secrets:ro
+    tmpfs:
+      - /tmp:size=64m,noexec,nosuid
+
+    # ── Health Check ──
+    healthcheck:
+      test: ["CMD", "bun", "-e", "fetch('http://127.0.0.1:8907/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+    # ── Environment ──
+    environment:
+      - NODE_ENV=production
+      - SECRETS_DIR=/secrets
+      - PORT=8907
