@@ -8,6 +8,8 @@ on:
       - "package.json"
       - "Dockerfile"
       - "tsconfig.json"
+      - ".github/workflows/**"
+      - "docker-compose.yml"
 
 permissions:
   contents: write
