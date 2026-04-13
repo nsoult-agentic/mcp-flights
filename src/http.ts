@@ -6,12 +6,69 @@ import { resolve } from "path";
 
 const PORT = Number(process.env["PORT"]) || 8907;
 const SECRETS_DIR = process.env["SECRETS_DIR"] || "/secrets";
+const SCRAPER_URL = process.env["SCRAPER_URL"] || ""; // e.g. http://mcp-flights-scraper:8908
 
-// --- Credential Loading ---
+// ============================================================
+// Flight Provider Interface
+// ============================================================
+
+interface FlightSearchParams {
+  from: string;
+  to: string;
+  date: string;
+  returnDate?: string;
+  travelClass?: number; // 1=economy, 2=premium_economy, 3=business, 4=first
+  adults?: number;
+  maxStops?: number;
+  currency?: string;
+}
+
+interface FlightLeg {
+  departureAirport: string;
+  departureTime: string;
+  arrivalAirport: string;
+  arrivalTime: string;
+  airline: string;
+  flightNumber: string;
+  duration: number; // minutes
+  aircraft?: string;
+  travelClass?: string;
+  legroom?: string;
+}
+
+interface FlightResult {
+  legs: FlightLeg[];
+  totalDuration: number; // minutes
+  stops: number;
+  price: number;
+  currency: string;
+  deepLink?: string;
+  source: string;
+}
+
+interface FlightSearchResponse {
+  results: FlightResult[];
+  source: string;
+  searchedAt: string;
+  priceInsights?: {
+    lowestPrice: number;
+    priceLevel: string;
+    typicalRange: [number, number];
+  };
+}
+
+interface FlightProvider {
+  name: string;
+  available(): boolean;
+  search(params: FlightSearchParams): Promise<FlightSearchResponse>;
+}
+
+// ============================================================
+// Credential Loading
+// ============================================================
 
 interface Credentials {
   serpApiKey: string;
-  kiwiApiKey: string;
 }
 
 function loadCredentials(): Credentials {
@@ -33,7 +90,6 @@ function loadCredentials(): Credentials {
 
   return {
     serpApiKey: env["SERPAPI_API_KEY"] || process.env["SERPAPI_API_KEY"] || "",
-    kiwiApiKey: env["KIWI_API_KEY"] || process.env["KIWI_API_KEY"] || "",
   };
 }
 
@@ -43,141 +99,168 @@ function getCreds(): Credentials {
   return _creds;
 }
 
-// --- SerpAPI Client ---
+// ============================================================
+// Provider: SerpAPI (Google Flights)
+// ============================================================
 
-interface SerpApiFlight {
-  departure_airport: { name: string; id: string; time: string };
-  arrival_airport: { name: string; id: string; time: string };
-  duration: number;
-  airplane: string;
-  airline: string;
-  flight_number: string;
-  travel_class: string;
-  legroom: string;
-  extensions: string[];
+const serpApiProvider: FlightProvider = {
+  name: "serpapi",
+
+  available(): boolean {
+    return !!getCreds().serpApiKey;
+  },
+
+  async search(params: FlightSearchParams): Promise<FlightSearchResponse> {
+    const creds = getCreds();
+    if (!creds.serpApiKey) throw new Error("SERPAPI_API_KEY not configured");
+
+    const qs = new URLSearchParams({
+      engine: "google_flights",
+      api_key: creds.serpApiKey,
+      departure_id: params.from.toUpperCase(),
+      arrival_id: params.to.toUpperCase(),
+      outbound_date: params.date,
+      type: params.returnDate ? "1" : "2",
+      adults: String(params.adults || 1),
+      currency: params.currency || "EUR",
+    });
+
+    if (params.returnDate) qs.set("return_date", params.returnDate);
+    if (params.travelClass) qs.set("travel_class", String(params.travelClass));
+    if (params.maxStops !== undefined) qs.set("stops", String(params.maxStops));
+
+    const resp = await fetch(`https://serpapi.com/search?${qs}`);
+    if (!resp.ok) throw new Error(`SerpAPI HTTP ${resp.status}`);
+
+    const data = await resp.json() as {
+      search_metadata: { status: string };
+      best_flights?: Array<{
+        flights: Array<{
+          departure_airport: { name: string; id: string; time: string };
+          arrival_airport: { name: string; id: string; time: string };
+          duration: number;
+          airplane: string;
+          airline: string;
+          flight_number: string;
+          travel_class: string;
+          legroom: string;
+        }>;
+        total_duration: number;
+        price: number;
+      }>;
+      other_flights?: Array<{
+        flights: Array<{
+          departure_airport: { name: string; id: string; time: string };
+          arrival_airport: { name: string; id: string; time: string };
+          duration: number;
+          airplane: string;
+          airline: string;
+          flight_number: string;
+          travel_class: string;
+          legroom: string;
+        }>;
+        total_duration: number;
+        price: number;
+      }>;
+      price_insights?: {
+        lowest_price: number;
+        price_level: string;
+        typical_price_range: number[];
+      };
+      error?: string;
+    };
+
+    if (data.error) throw new Error(`SerpAPI: ${data.error}`);
+
+    const allRaw = [...(data.best_flights || []), ...(data.other_flights || [])];
+    const currency = params.currency || "EUR";
+
+    const results: FlightResult[] = allRaw.map((f) => ({
+      legs: f.flights.map((leg) => ({
+        departureAirport: leg.departure_airport.id,
+        departureTime: leg.departure_airport.time,
+        arrivalAirport: leg.arrival_airport.id,
+        arrivalTime: leg.arrival_airport.time,
+        airline: leg.airline,
+        flightNumber: leg.flight_number,
+        duration: leg.duration,
+        aircraft: leg.airplane,
+        travelClass: leg.travel_class,
+        legroom: leg.legroom,
+      })),
+      totalDuration: f.total_duration,
+      stops: f.flights.length - 1,
+      price: f.price,
+      currency,
+      source: "serpapi",
+    }));
+
+    const response: FlightSearchResponse = {
+      results,
+      source: "Google Flights via SerpAPI",
+      searchedAt: new Date().toISOString(),
+    };
+
+    if (data.price_insights) {
+      response.priceInsights = {
+        lowestPrice: data.price_insights.lowest_price,
+        priceLevel: data.price_insights.price_level,
+        typicalRange: [
+          data.price_insights.typical_price_range[0],
+          data.price_insights.typical_price_range[1],
+        ],
+      };
+    }
+
+    return response;
+  },
+};
+
+// ============================================================
+// Provider: Playwright Scraper (stub — separate container)
+// ============================================================
+
+const playwrightProvider: FlightProvider = {
+  name: "playwright",
+
+  available(): boolean {
+    return !!SCRAPER_URL;
+  },
+
+  async search(params: FlightSearchParams): Promise<FlightSearchResponse> {
+    if (!SCRAPER_URL) {
+      throw new Error(
+        "Playwright scraper not configured. Set SCRAPER_URL env var to the mcp-flights-scraper endpoint.",
+      );
+    }
+
+    // Future: POST to mcp-flights-scraper service
+    // const resp = await fetch(`${SCRAPER_URL}/scrape/flights`, {
+    //   method: "POST",
+    //   headers: { "Content-Type": "application/json" },
+    //   body: JSON.stringify(params),
+    // });
+    // return resp.json() as Promise<FlightSearchResponse>;
+
+    throw new Error(
+      "Playwright scraper not yet implemented. Will be built as a separate container (mcp-flights-scraper) when needed.",
+    );
+  },
+};
+
+// ============================================================
+// Provider Registry
+// ============================================================
+
+const providers: FlightProvider[] = [serpApiProvider, playwrightProvider];
+
+function getProvider(name: string): FlightProvider | undefined {
+  return providers.find((p) => p.name === name);
 }
 
-interface SerpApiResult {
-  flights: SerpApiFlight[];
-  total_duration: number;
-  price: number;
-  type: string;
-  carbon_emissions?: { this_flight: number; typical_for_route: number };
-}
-
-interface SerpApiResponse {
-  search_metadata: { status: string };
-  best_flights?: SerpApiResult[];
-  other_flights?: SerpApiResult[];
-  price_insights?: {
-    lowest_price: number;
-    price_level: string;
-    typical_price_range: number[];
-  };
-  error?: string;
-}
-
-async function searchSerpApi(params: {
-  from: string;
-  to: string;
-  date: string;
-  returnDate?: string;
-  travelClass?: number;
-  adults?: number;
-  stops?: number;
-  currency?: string;
-}): Promise<SerpApiResponse> {
-  const creds = getCreds();
-  if (!creds.serpApiKey) throw new Error("SERPAPI_API_KEY not configured");
-
-  const qs = new URLSearchParams({
-    engine: "google_flights",
-    api_key: creds.serpApiKey,
-    departure_id: params.from.toUpperCase(),
-    arrival_id: params.to.toUpperCase(),
-    outbound_date: params.date,
-    type: params.returnDate ? "1" : "2",
-    adults: String(params.adults || 1),
-    currency: params.currency || "EUR",
-  });
-
-  if (params.returnDate) qs.set("return_date", params.returnDate);
-  if (params.travelClass) qs.set("travel_class", String(params.travelClass));
-  if (params.stops !== undefined) qs.set("stops", String(params.stops));
-
-  const resp = await fetch(`https://serpapi.com/search?${qs}`);
-  if (!resp.ok) throw new Error(`SerpAPI error: ${resp.status}`);
-  return resp.json() as Promise<SerpApiResponse>;
-}
-
-// --- Kiwi Tequila Client ---
-
-interface KiwiRoute {
-  local_departure: string;
-  local_arrival: string;
-  flyFrom: string;
-  flyTo: string;
-  cityFrom: string;
-  cityTo: string;
-  airline: string;
-  flight_no: number;
-  equipment: string;
-}
-
-interface KiwiResult {
-  id: string;
-  price: number;
-  route: KiwiRoute[];
-  deep_link: string;
-  availability: { seats: number };
-}
-
-interface KiwiResponse {
-  data: KiwiResult[];
-  currency: string;
-  search_params: Record<string, string>;
-}
-
-async function searchKiwi(params: {
-  from: string;
-  to: string;
-  dateFrom: string;
-  dateTo: string;
-  returnFrom?: string;
-  returnTo?: string;
-  adults?: number;
-  currency?: string;
-  maxStopovers?: number;
-}): Promise<KiwiResponse> {
-  const creds = getCreds();
-  if (!creds.kiwiApiKey) throw new Error("KIWI_API_KEY not configured");
-
-  const qs = new URLSearchParams({
-    fly_from: params.from.toUpperCase(),
-    fly_to: params.to.toUpperCase(),
-    date_from: params.dateFrom,
-    date_to: params.dateTo,
-    curr: params.currency || "EUR",
-    adults: String(params.adults || 1),
-    flight_type: params.returnFrom ? "round" : "oneway",
-    limit: "10",
-    sort: "price",
-  });
-
-  if (params.returnFrom) qs.set("return_from", params.returnFrom);
-  if (params.returnTo) qs.set("return_to", params.returnTo);
-  if (params.maxStopovers !== undefined)
-    qs.set("max_stopovers", String(params.maxStopovers));
-
-  const resp = await fetch(
-    `https://tequila-api.kiwi.com/v2/search?${qs}`,
-    { headers: { apikey: creds.kiwiApiKey } },
-  );
-  if (!resp.ok) throw new Error(`Kiwi API error: ${resp.status}`);
-  return resp.json() as Promise<KiwiResponse>;
-}
-
-// --- Formatters ---
+// ============================================================
+// Formatters
+// ============================================================
 
 function formatDuration(minutes: number): string {
   const h = Math.floor(minutes / 60);
@@ -205,23 +288,18 @@ function travelClassLabel(n: number): string {
   }
 }
 
-function formatSerpApiResults(data: SerpApiResponse, source: string): string {
+function formatResults(data: FlightSearchResponse): string {
   const lines: string[] = [];
-  lines.push(`## Flight Results (${source})\n`);
+  lines.push(`## Flight Results (${data.source})\n`);
 
-  if (data.price_insights) {
-    const pi = data.price_insights;
+  if (data.priceInsights) {
+    const pi = data.priceInsights;
     lines.push(
-      `**Price insights:** ${pi.price_level} — typical range ${pi.typical_price_range[0]}–${pi.typical_price_range[1]} EUR, lowest ${pi.lowest_price} EUR\n`,
+      `**Price insights:** ${pi.priceLevel} — typical range ${pi.typicalRange[0]}–${pi.typicalRange[1]} EUR, lowest ${pi.lowestPrice} EUR\n`,
     );
   }
 
-  const allFlights = [
-    ...(data.best_flights || []).map((f) => ({ ...f, _tier: "Best" })),
-    ...(data.other_flights || []).map((f) => ({ ...f, _tier: "Other" })),
-  ];
-
-  if (allFlights.length === 0) {
+  if (data.results.length === 0) {
     lines.push("No flights found for this route and date.\n");
     return lines.join("\n");
   }
@@ -233,57 +311,31 @@ function formatSerpApiResults(data: SerpApiResponse, source: string): string {
     "|---|-------|---------|----------|-------|-------|-------|---------|",
   );
 
-  for (let i = 0; i < Math.min(allFlights.length, 15); i++) {
-    const f = allFlights[i];
-    const legs = f.flights;
-    const first = legs[0];
-    const last = legs[legs.length - 1];
-    const stops = legs.length - 1;
-    const route = `${first.departure_airport.id} → ${last.arrival_airport.id}`;
+  for (let i = 0; i < Math.min(data.results.length, 15); i++) {
+    const f = data.results[i];
+    const first = f.legs[0];
+    const last = f.legs[f.legs.length - 1];
+    const route = `${first.departureAirport} → ${last.arrivalAirport}`;
     const airline = first.airline;
-    const dur = formatDuration(f.total_duration);
-    const cls = first.travel_class || "Economy";
+    const dur = formatDuration(f.totalDuration);
+    const cls = first.travelClass || "Economy";
     const legroom = first.legroom || "—";
+    const stopsLabel =
+      f.stops === 0 ? "Direct" : `${f.stops} stop${f.stops > 1 ? "s" : ""}`;
     lines.push(
-      `| ${i + 1} | ${route} | ${airline} | ${dur} | ${stops === 0 ? "Direct" : stops + " stop" + (stops > 1 ? "s" : "")} | ${cls} | ${f.price} EUR | ${legroom} |`,
+      `| ${i + 1} | ${route} | ${airline} | ${dur} | ${stopsLabel} | ${cls} | ${f.price} ${f.currency} | ${legroom} |`,
     );
   }
 
-  lines.push(`\n*${allFlights.length} results total. Prices as of search time — may change.*`);
+  lines.push(
+    `\n*${data.results.length} results total. Prices as of ${data.searchedAt} — may change.*`,
+  );
   return lines.join("\n");
 }
 
-function formatKiwiResults(data: KiwiResponse): string {
-  const lines: string[] = [];
-  lines.push("## Flight Results (Kiwi)\n");
-
-  if (!data.data || data.data.length === 0) {
-    lines.push("No flights found for this route and date range.\n");
-    return lines.join("\n");
-  }
-
-  lines.push("| # | Route | Airlines | Stops | Price | Book |");
-  lines.push("|---|-------|----------|-------|-------|------|");
-
-  for (let i = 0; i < Math.min(data.data.length, 10); i++) {
-    const f = data.data[i];
-    const r = f.route;
-    const first = r[0];
-    const last = r[r.length - 1];
-    const route = `${first.flyFrom} → ${last.flyTo}`;
-    const airlines = [...new Set(r.map((s) => s.airline))].join(", ");
-    const stops = r.length - 1;
-    const link = `[Book](${f.deep_link})`;
-    lines.push(
-      `| ${i + 1} | ${route} | ${airlines} | ${stops === 0 ? "Direct" : stops + " stop" + (stops > 1 ? "s" : "")} | ${f.price} ${data.currency} | ${link} |`,
-    );
-  }
-
-  lines.push(`\n*${data.data.length} results total. Prices as of search time — may change.*`);
-  return lines.join("\n");
-}
-
-// --- Tool: Search Flights ---
+// ============================================================
+// Tool: Search Flights
+// ============================================================
 
 async function searchFlights(params: {
   from: string;
@@ -297,79 +349,76 @@ async function searchFlights(params: {
   source?: string;
 }): Promise<string> {
   const currency = params.currency || "EUR";
-  const source = params.source || "serpapi";
+  const requestedSource = params.source || "auto";
+  const travelClass = travelClassToInt(params.travelClass || "economy");
   const results: string[] = [];
-  const timestamp = new Date().toISOString();
 
-  results.push(`*Search: ${params.from.toUpperCase()} → ${params.to.toUpperCase()} on ${params.date}${params.returnDate ? ` (return ${params.returnDate})` : ""} | ${travelClassLabel(travelClassToInt(params.travelClass || "economy"))} | ${timestamp}*\n`);
+  results.push(
+    `*Search: ${params.from.toUpperCase()} → ${params.to.toUpperCase()} on ${params.date}${params.returnDate ? ` (return ${params.returnDate})` : ""} | ${travelClassLabel(travelClass)} | ${new Date().toISOString()}*\n`,
+  );
 
-  if (source === "serpapi" || source === "both") {
-    try {
-      const serpData = await searchSerpApi({
-        from: params.from,
-        to: params.to,
-        date: params.date,
-        returnDate: params.returnDate,
-        travelClass: travelClassToInt(params.travelClass || "economy"),
-        adults: params.adults,
-        stops: params.maxStops,
-        currency,
-      });
-      if (serpData.error) {
-        results.push(`**SerpAPI error:** ${serpData.error}\n`);
-      } else {
-        results.push(formatSerpApiResults(serpData, "Google Flights via SerpAPI"));
+  const searchParams: FlightSearchParams = {
+    from: params.from,
+    to: params.to,
+    date: params.date,
+    returnDate: params.returnDate,
+    travelClass,
+    adults: params.adults,
+    maxStops: params.maxStops,
+    currency,
+  };
+
+  // Determine provider order
+  const order: string[] =
+    requestedSource === "auto"
+      ? ["serpapi", "playwright"]
+      : [requestedSource];
+
+  let succeeded = false;
+
+  for (const providerName of order) {
+    const provider = getProvider(providerName);
+    if (!provider) {
+      results.push(`**${providerName}:** Unknown provider.\n`);
+      continue;
+    }
+    if (!provider.available()) {
+      if (requestedSource !== "auto") {
+        results.push(`**${providerName}:** Not configured.\n`);
       }
+      continue;
+    }
+
+    try {
+      const data = await provider.search(searchParams);
+      results.push(formatResults(data));
+      succeeded = true;
+      break; // Stop on first success
     } catch (e) {
-      results.push(`**SerpAPI unavailable:** ${(e as Error).message}\n`);
+      results.push(`**${providerName} error:** ${(e as Error).message}\n`);
     }
   }
 
-  if (source === "kiwi" || source === "both") {
-    try {
-      // Kiwi uses dd/mm/YYYY format
-      const [y, m, d] = params.date.split("-");
-      const dateFrom = `${d}/${m}/${y}`;
-      let returnFrom: string | undefined;
-      let returnTo: string | undefined;
-      if (params.returnDate) {
-        const [ry, rm, rd] = params.returnDate.split("-");
-        returnFrom = `${rd}/${rm}/${ry}`;
-        returnTo = returnFrom;
-      }
-      const kiwiData = await searchKiwi({
-        from: params.from,
-        to: params.to,
-        dateFrom,
-        dateTo: dateFrom,
-        returnFrom,
-        returnTo,
-        adults: params.adults,
-        currency,
-        maxStopovers: params.maxStops,
-      });
-      results.push(formatKiwiResults(kiwiData));
-    } catch (e) {
-      results.push(`**Kiwi unavailable:** ${(e as Error).message}\n`);
-    }
-  }
-
-  if (results.length <= 1) {
+  if (!succeeded) {
     results.push("No results from any source. Check dates and airport codes.\n");
-    results.push(`**Manual check:** [Google Flights](https://www.google.com/travel/flights?q=flights+from+${params.from}+to+${params.to}+on+${params.date})`);
+    results.push(
+      `**Manual check:** [Google Flights](https://www.google.com/travel/flights?q=flights+from+${params.from}+to+${params.to}+on+${params.date})`,
+    );
   }
 
   return results.join("\n");
 }
 
-// --- Tool: API Usage ---
+// ============================================================
+// Tool: API Usage
+// ============================================================
 
 async function checkApiUsage(): Promise<string> {
   const creds = getCreds();
   const lines: string[] = ["## Flight API Status\n"];
 
-  lines.push("| API | Status | Free Tier |");
-  lines.push("|-----|--------|-----------|");
+  lines.push("| Provider | Status | Free Tier |");
+  lines.push("|----------|--------|-----------|");
 
   // SerpAPI
   if (creds.serpApiKey) {
@@ -379,7 +428,6 @@ async function checkApiUsage(): Promise<string> {
       );
       if (resp.ok) {
         const data = (await resp.json()) as {
-          total_searches_left: number;
           plan_searches_left: number;
           plan_name: string;
         };
@@ -396,27 +444,38 @@ async function checkApiUsage(): Promise<string> {
     lines.push("| SerpAPI | **NOT CONFIGURED** | 250/month |");
   }
 
-  // Kiwi
-  if (creds.kiwiApiKey) {
-    lines.push("| Kiwi Tequila | Key configured | Free (affiliate model) |");
+  // Playwright scraper
+  if (SCRAPER_URL) {
+    try {
+      const resp = await fetch(`${SCRAPER_URL}/health`);
+      if (resp.ok) {
+        lines.push("| Playwright Scraper | Online | Free (self-hosted) |");
+      } else {
+        lines.push("| Playwright Scraper | Unhealthy | Free (self-hosted) |");
+      }
+    } catch {
+      lines.push("| Playwright Scraper | Unreachable | Free (self-hosted) |");
+    }
   } else {
-    lines.push("| Kiwi Tequila | **NOT CONFIGURED** | Free (affiliate model) |");
+    lines.push("| Playwright Scraper | Not deployed | Free (self-hosted) |");
   }
 
   return lines.join("\n");
 }
 
-// --- MCP Server ---
+// ============================================================
+// MCP Server
+// ============================================================
 
 function createServer(): McpServer {
   const server = new McpServer({
     name: "mcp-flights",
-    version: "0.1.0",
+    version: "0.2.0",
   });
 
   server.tool(
     "flights-search",
-    "Search for flights between two airports. Returns prices, airlines, duration, stops, and booking links. Uses Google Flights (via SerpAPI) as primary source and Kiwi as fallback.",
+    "Search for flights between two airports. Returns prices, airlines, duration, stops, and cabin class. Primary source: Google Flights via SerpAPI. Fallback: Playwright browser scraper (when deployed).",
     {
       from: z
         .string()
@@ -428,9 +487,7 @@ function createServer(): McpServer {
         .min(2)
         .max(4)
         .describe("Arrival airport IATA code (e.g., NRT, CDG, LAX)"),
-      date: z
-        .string()
-        .describe("Departure date in YYYY-MM-DD format"),
+      date: z.string().describe("Departure date in YYYY-MM-DD format"),
       returnDate: z
         .string()
         .optional()
@@ -461,10 +518,10 @@ function createServer(): McpServer {
         .default("EUR")
         .describe("Price currency (default: EUR)"),
       source: z
-        .enum(["serpapi", "kiwi", "both"])
+        .enum(["auto", "serpapi", "playwright"])
         .optional()
-        .default("serpapi")
-        .describe("Data source: serpapi (Google Flights), kiwi, or both"),
+        .default("auto")
+        .describe("Data source: auto (try providers in order), serpapi, or playwright"),
     },
     async (params) => ({
       content: [
@@ -475,7 +532,7 @@ function createServer(): McpServer {
 
   server.tool(
     "flights-api-usage",
-    "Check flight API key status and remaining quota.",
+    "Check flight API key status and remaining quota for all configured providers.",
     {},
     async () => ({
       content: [
@@ -487,7 +544,9 @@ function createServer(): McpServer {
   return server;
 }
 
-// --- HTTP Server ---
+// ============================================================
+// HTTP Server
+// ============================================================
 
 const httpServer = Bun.serve({
   port: PORT,
@@ -497,7 +556,15 @@ const httpServer = Bun.serve({
 
     if (url.pathname === "/health") {
       return new Response(
-        JSON.stringify({ status: "ok", service: "mcp-flights", version: "0.1.0" }),
+        JSON.stringify({
+          status: "ok",
+          service: "mcp-flights",
+          version: "0.2.0",
+          providers: providers.map((p) => ({
+            name: p.name,
+            available: p.available(),
+          })),
+        }),
         { headers: { "Content-Type": "application/json" } },
       );
     }
@@ -515,7 +582,10 @@ const httpServer = Bun.serve({
   },
 });
 
-console.log(`mcp-flights listening on http://0.0.0.0:${PORT}/mcp`);
+console.log(`mcp-flights v0.2.0 listening on http://0.0.0.0:${PORT}/mcp`);
+console.log(
+  `Providers: ${providers.map((p) => `${p.name}=${p.available() ? "ready" : "not configured"}`).join(", ")}`,
+);
 
 process.on("SIGTERM", () => {
   httpServer.stop();
