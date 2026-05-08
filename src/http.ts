@@ -305,10 +305,10 @@ function formatResults(data: FlightSearchResponse): string {
   }
 
   lines.push(
-    "| # | Route | Airline | Duration | Stops | Class | Price | Legroom |",
+    "| # | Route | Depart | Arrive | Airline | Flight | Duration | Stops | Class | Price | Legroom |",
   );
   lines.push(
-    "|---|-------|---------|----------|-------|-------|-------|---------|",
+    "|---|-------|--------|--------|---------|--------|----------|-------|-------|-------|---------|",
   );
 
   for (let i = 0; i < Math.min(data.results.length, 15); i++) {
@@ -316,14 +316,17 @@ function formatResults(data: FlightSearchResponse): string {
     const first = f.legs[0];
     const last = f.legs[f.legs.length - 1];
     const route = `${first.departureAirport} → ${last.arrivalAirport}`;
+    const depart = first.departureTime || "—";
+    const arrive = last.arrivalTime || "—";
     const airline = first.airline;
+    const flightNo = first.flightNumber || "—";
     const dur = formatDuration(f.totalDuration);
     const cls = first.travelClass || "Economy";
     const legroom = first.legroom || "—";
     const stopsLabel =
       f.stops === 0 ? "Direct" : `${f.stops} stop${f.stops > 1 ? "s" : ""}`;
     lines.push(
-      `| ${i + 1} | ${route} | ${airline} | ${dur} | ${stopsLabel} | ${cls} | ${f.price} ${f.currency} | ${legroom} |`,
+      `| ${i + 1} | ${route} | ${depart} | ${arrive} | ${airline} | ${flightNo} | ${dur} | ${stopsLabel} | ${cls} | ${f.price} ${f.currency} | ${legroom} |`,
     );
   }
 
