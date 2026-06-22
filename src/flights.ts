@@ -184,14 +184,16 @@ export function parseSerpApiResponse(data: SerpSearchData, currency: string): Fl
   };
 
   if (data.price_insights) {
-    response.priceInsights = {
-      lowestPrice: data.price_insights.lowest_price,
-      priceLevel: data.price_insights.price_level,
-      typicalRange: [
-        data.price_insights.typical_price_range[0],
-        data.price_insights.typical_price_range[1],
-      ],
-    };
+    const range = data.price_insights.typical_price_range;
+    const low = range[0];
+    const high = range[1];
+    if (low !== undefined && high !== undefined) {
+      response.priceInsights = {
+        lowestPrice: data.price_insights.lowest_price,
+        priceLevel: data.price_insights.price_level,
+        typicalRange: [low, high],
+      };
+    }
   }
 
   return response;
@@ -202,6 +204,24 @@ export function parseSerpApiResponse(data: SerpSearchData, currency: string): Fl
 // ============================================================
 
 export const MAX_RESULT_ROWS = 15;
+
+// Format a single result as a Markdown table row, or null if the result has no
+// usable legs (and should be skipped).
+function formatResultRow(f: FlightResult, index: number): string | null {
+  const first = f.legs[0];
+  const last = f.legs[f.legs.length - 1];
+  if (first === undefined || last === undefined) return null;
+  const route = `${first.departureAirport} → ${last.arrivalAirport}`;
+  const depart = first.departureTime || "—";
+  const arrive = last.arrivalTime || "—";
+  const airline = first.airline;
+  const flightNo = first.flightNumber || "—";
+  const dur = formatDuration(f.totalDuration);
+  const cls = first.travelClass || "Economy";
+  const legroom = first.legroom || "—";
+  const stopsLabel = f.stops === 0 ? "Direct" : `${f.stops} stop${f.stops > 1 ? "s" : ""}`;
+  return `| ${index + 1} | ${route} | ${depart} | ${arrive} | ${airline} | ${flightNo} | ${dur} | ${stopsLabel} | ${cls} | ${f.price} ${f.currency} | ${legroom} |`;
+}
 
 export function formatResults(data: FlightSearchResponse): string {
   const lines: string[] = [];
@@ -228,20 +248,9 @@ export function formatResults(data: FlightSearchResponse): string {
 
   for (let i = 0; i < Math.min(data.results.length, MAX_RESULT_ROWS); i++) {
     const f = data.results[i];
-    const first = f.legs[0];
-    const last = f.legs[f.legs.length - 1];
-    const route = `${first.departureAirport} → ${last.arrivalAirport}`;
-    const depart = first.departureTime || "—";
-    const arrive = last.arrivalTime || "—";
-    const airline = first.airline;
-    const flightNo = first.flightNumber || "—";
-    const dur = formatDuration(f.totalDuration);
-    const cls = first.travelClass || "Economy";
-    const legroom = first.legroom || "—";
-    const stopsLabel = f.stops === 0 ? "Direct" : `${f.stops} stop${f.stops > 1 ? "s" : ""}`;
-    lines.push(
-      `| ${i + 1} | ${route} | ${depart} | ${arrive} | ${airline} | ${flightNo} | ${dur} | ${stopsLabel} | ${cls} | ${f.price} ${f.currency} | ${legroom} |`,
-    );
+    if (f === undefined) continue;
+    const row = formatResultRow(f, i);
+    if (row !== null) lines.push(row);
   }
 
   lines.push(

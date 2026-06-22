@@ -137,16 +137,62 @@ function getProvider(name: string): FlightProvider | undefined {
 // Tool: Search Flights
 // ============================================================
 
+// Try a single provider; pushes its status/results into `results` and returns
+// true only if it produced flight results (i.e. the loop should stop).
+async function tryProvider(
+  providerName: string,
+  requestedSource: string,
+  searchParams: FlightSearchParams,
+  results: string[],
+): Promise<boolean> {
+  const provider = getProvider(providerName);
+  if (!provider) {
+    results.push(`**${providerName}:** Unknown provider.\n`);
+    return false;
+  }
+  if (!provider.available()) {
+    if (requestedSource !== "auto") {
+      results.push(`**${providerName}:** Not configured.\n`);
+    }
+    return false;
+  }
+
+  try {
+    const data = await provider.search(searchParams);
+    results.push(formatResults(data));
+    return true;
+  } catch (e) {
+    results.push(`**${providerName} error:** ${(e as Error).message}\n`);
+    return false;
+  }
+}
+
+// Run providers in order, stopping on the first success.
+async function runProviders(
+  order: string[],
+  requestedSource: string,
+  searchParams: FlightSearchParams,
+  results: string[],
+): Promise<boolean> {
+  for (const providerName of order) {
+    if (await tryProvider(providerName, requestedSource, searchParams, results)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 async function searchFlights(params: {
   from: string;
   to: string;
   date: string;
-  returnDate?: string;
-  travelClass?: string;
-  adults?: number;
-  maxStops?: number;
-  currency?: string;
-  source?: string;
+  // I/O boundary: these come from Zod `.optional()` shapes, which produce `T | undefined`.
+  returnDate?: string | undefined;
+  travelClass?: string | undefined;
+  adults?: number | undefined;
+  maxStops?: number | undefined;
+  currency?: string | undefined;
+  source?: string | undefined;
 }): Promise<string> {
   const currency = params.currency || "EUR";
   const requestedSource = params.source || "auto";
@@ -161,40 +207,17 @@ async function searchFlights(params: {
     from: params.from,
     to: params.to,
     date: params.date,
-    returnDate: params.returnDate,
     travelClass,
-    adults: params.adults,
-    maxStops: params.maxStops,
     currency,
+    ...(params.returnDate !== undefined ? { returnDate: params.returnDate } : {}),
+    ...(params.adults !== undefined ? { adults: params.adults } : {}),
+    ...(params.maxStops !== undefined ? { maxStops: params.maxStops } : {}),
   };
 
   // Determine provider order
   const order: string[] = resolveProviderOrder(requestedSource);
 
-  let succeeded = false;
-
-  for (const providerName of order) {
-    const provider = getProvider(providerName);
-    if (!provider) {
-      results.push(`**${providerName}:** Unknown provider.\n`);
-      continue;
-    }
-    if (!provider.available()) {
-      if (requestedSource !== "auto") {
-        results.push(`**${providerName}:** Not configured.\n`);
-      }
-      continue;
-    }
-
-    try {
-      const data = await provider.search(searchParams);
-      results.push(formatResults(data));
-      succeeded = true;
-      break; // Stop on first success
-    } catch (e) {
-      results.push(`**${providerName} error:** ${(e as Error).message}\n`);
-    }
-  }
+  const succeeded = await runProviders(order, requestedSource, searchParams, results);
 
   if (!succeeded) {
     results.push("No results from any source. Check dates and airport codes.\n");
@@ -350,9 +373,8 @@ const httpServer = Bun.serve({
 
     if (url.pathname === "/mcp") {
       const server = createServer();
-      const transport = new WebStandardStreamableHTTPServerTransport({
-        sessionIdGenerator: undefined,
-      });
+      // Stateless mode: omitting sessionIdGenerator leaves it undefined (no sessions).
+      const transport = new WebStandardStreamableHTTPServerTransport({});
       await server.connect(transport);
       return transport.handleRequest(req);
     }
