@@ -4,7 +4,7 @@
 
 services:
   mcp-flights:
-    image: ghcr.io/nsoult-agentic/mcp-flights:sha-3faef18
+    image: ghcr.io/nsoult-agentic/mcp-flights:sha-8669c40
     container_name: mcp-flights
     restart: unless-stopped
 
