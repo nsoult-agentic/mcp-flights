@@ -9,6 +9,7 @@ import {
   formatResults,
   googleFlightsManualUrl,
   MAX_RESULT_ROWS,
+  maxStopsToSerpStops,
   parseSerpApiResponse,
   resolveProviderOrder,
   type SerpRawFlight,
@@ -157,10 +158,36 @@ describe("buildSerpApiQuery", () => {
     expect(buildSerpApiQuery({ ...base, travelClass: 3 }, "K").get("travel_class")).toBe("3");
   });
 
-  test("stops set for any defined value including 0", () => {
+  test("stops is omitted when maxStops is undefined", () => {
     expect(buildSerpApiQuery(base, "K").has("stops")).toBe(false);
-    expect(buildSerpApiQuery({ ...base, maxStops: 0 }, "K").get("stops")).toBe("0");
-    expect(buildSerpApiQuery({ ...base, maxStops: 2 }, "K").get("stops")).toBe("2");
+  });
+
+  test("maxStops is mapped to SerpAPI's stops enum (not passed through raw)", () => {
+    // SerpAPI stops: 0=any, 1=nonstop, 2=≤1 stop, 3=≤2 stops.
+    // Our maxStops: 0=direct only, N=up to N stops. Mapping is maxStops+1,
+    // with maxStops≥3 falling back to 0 (any) since there is no "≤3" value.
+    expect(buildSerpApiQuery({ ...base, maxStops: 0 }, "K").get("stops")).toBe("1");
+    expect(buildSerpApiQuery({ ...base, maxStops: 1 }, "K").get("stops")).toBe("2");
+    expect(buildSerpApiQuery({ ...base, maxStops: 2 }, "K").get("stops")).toBe("3");
+    expect(buildSerpApiQuery({ ...base, maxStops: 3 }, "K").get("stops")).toBe("0");
+  });
+});
+
+describe("maxStopsToSerpStops", () => {
+  test("direct-only (0) maps to SerpAPI nonstop (1)", () => {
+    // Regression: maxStops=1 used to be sent as SerpAPI stops=1 (nonstop only),
+    // returning empty on routes with no direct flight (e.g. BCN→BKK).
+    expect(maxStopsToSerpStops(0)).toBe(1);
+  });
+
+  test("maxStops N maps to N+1 for N in 1..2", () => {
+    expect(maxStopsToSerpStops(1)).toBe(2); // ≤1 stop
+    expect(maxStopsToSerpStops(2)).toBe(3); // ≤2 stops
+  });
+
+  test("maxStops ≥ 3 falls back to 0 (any) — no ≤3 enum in SerpAPI", () => {
+    expect(maxStopsToSerpStops(3)).toBe(0);
+    expect(maxStopsToSerpStops(9)).toBe(0);
   });
 });
 
@@ -286,6 +313,27 @@ describe("formatResults", () => {
     twoLeg.flights = [firstLeg, firstLeg, firstLeg]; // 3 legs -> 2 stops
     const parsed = parseSerpApiResponse({ best_flights: [twoLeg] }, "EUR");
     expect(formatResults(parsed)).toContain("2 stops");
+  });
+
+  test("labels a mixed-cabin itinerary by its longest leg, not leg 0", () => {
+    // A premium-economy fare commonly has an economy short-haul connector as its
+    // first leg. Labeling by leg 0 mislabeled the whole itinerary "Economy";
+    // it must reflect the primary (longest) leg instead.
+    const mixed = rawFlight();
+    const shortEconomyLeg = mixed.flights[0];
+    expect(shortEconomyLeg).toBeDefined();
+    if (!shortEconomyLeg) return;
+    const longPremiumLeg = {
+      ...shortEconomyLeg,
+      duration: 600,
+      travel_class: "Premium economy",
+    };
+    mixed.flights = [{ ...shortEconomyLeg, duration: 60, travel_class: "Economy" }, longPremiumLeg];
+    const parsed = parseSerpApiResponse({ best_flights: [mixed] }, "EUR");
+    const out = formatResults(parsed);
+    const dataRow = out.split("\n").find((l) => /^\|\s\d+\s\|/.test(l));
+    expect(dataRow).toBeDefined();
+    expect(dataRow).toContain("Premium economy");
   });
 
   test("caps the table at MAX_RESULT_ROWS rows but reports the true total", () => {

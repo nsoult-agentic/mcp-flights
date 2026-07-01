@@ -19,6 +19,10 @@ import {
 const PORT = Number(process.env["PORT"]) || 8907;
 const SECRETS_DIR = process.env["SECRETS_DIR"] || "/secrets";
 const SCRAPER_URL = process.env["SCRAPER_URL"] || ""; // e.g. http://mcp-flights-scraper:8908
+// Bound every upstream call so a slow/stuck provider under concurrent load can
+// never leave an MCP request hanging (which the client reports as "Connection
+// closed" and then tears down the whole session).
+const FETCH_TIMEOUT_MS = Number(process.env["FETCH_TIMEOUT_MS"]) || 25_000;
 
 // ============================================================
 // Flight Provider Interface
@@ -81,10 +85,25 @@ const serpApiProvider: FlightProvider = {
 
     const qs = buildSerpApiQuery(params, creds.serpApiKey);
 
-    const resp = await fetch(`https://serpapi.com/search?${qs}`);
+    let resp: Response;
+    try {
+      resp = await fetch(`https://serpapi.com/search?${qs}`, {
+        signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+      });
+    } catch (e) {
+      if ((e as Error).name === "TimeoutError") {
+        throw new Error(`SerpAPI request timed out after ${FETCH_TIMEOUT_MS}ms`);
+      }
+      throw new Error(`SerpAPI request failed: ${(e as Error).message}`);
+    }
     if (!resp.ok) throw new Error(`SerpAPI HTTP ${resp.status}`);
 
-    const data = (await resp.json()) as SerpSearchData;
+    let data: SerpSearchData;
+    try {
+      data = (await resp.json()) as SerpSearchData;
+    } catch {
+      throw new Error("SerpAPI returned a malformed (non-JSON) response");
+    }
     const currency = params.currency || "EUR";
 
     return parseSerpApiResponse(data, currency);
@@ -288,7 +307,7 @@ async function checkApiUsage(): Promise<string> {
 function createServer(): McpServer {
   const server = new McpServer({
     name: "mcp-flights",
-    version: "0.2.0",
+    version: "0.3.0",
   });
 
   server.tool(
@@ -350,10 +369,47 @@ function createServer(): McpServer {
 // HTTP Server
 // ============================================================
 
-const httpServer = Bun.serve({
-  port: PORT,
-  hostname: "0.0.0.0",
-  async fetch(req: Request): Promise<Response> {
+const VERSION = "0.3.0";
+
+function jsonRpcErrorResponse(status: number, code: number, message: string): Response {
+  return new Response(JSON.stringify({ jsonrpc: "2.0", error: { code, message }, id: null }), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+// Handle a single MCP request. The stateless pattern requires a FRESH server +
+// transport per request (the SDK throws if a stateless transport is reused), so
+// there is no cross-request shared state. Any failure here is contained: it
+// returns a JSON-RPC error instead of rejecting, so one bad request can never
+// take down the process or drop the whole MCP session.
+async function handleMcpRequest(req: Request): Promise<Response> {
+  const server = createServer();
+  // Stateless mode: omitting sessionIdGenerator leaves it undefined (no sessions).
+  const transport = new WebStandardStreamableHTTPServerTransport({});
+  try {
+    await server.connect(transport);
+    return await transport.handleRequest(req);
+  } catch (err) {
+    console.error("[mcp] request handling failed:", err);
+    // Best-effort teardown so a failed request leaks nothing.
+    try {
+      await transport.close();
+    } catch {
+      /* already closed */
+    }
+    try {
+      await server.close();
+    } catch {
+      /* already closed */
+    }
+    return jsonRpcErrorResponse(500, -32603, "Internal server error");
+  }
+}
+
+// Exported for tests: the full HTTP router. Never rejects.
+export async function handleRequest(req: Request): Promise<Response> {
+  try {
     const url = new URL(req.url);
 
     if (url.pathname === "/health") {
@@ -361,7 +417,7 @@ const httpServer = Bun.serve({
         JSON.stringify({
           status: "ok",
           service: "mcp-flights",
-          version: "0.2.0",
+          version: VERSION,
           providers: providers.map((p) => ({
             name: p.name,
             available: p.available(),
@@ -372,23 +428,47 @@ const httpServer = Bun.serve({
     }
 
     if (url.pathname === "/mcp") {
-      const server = createServer();
-      // Stateless mode: omitting sessionIdGenerator leaves it undefined (no sessions).
-      const transport = new WebStandardStreamableHTTPServerTransport({});
-      await server.connect(transport);
-      return transport.handleRequest(req);
+      return await handleMcpRequest(req);
     }
 
     return new Response("Not Found", { status: 404 });
-  },
-});
+  } catch (err) {
+    console.error("[http] unexpected router error:", err);
+    return jsonRpcErrorResponse(500, -32603, "Internal server error");
+  }
+}
 
-console.log(`mcp-flights v0.2.0 listening on http://0.0.0.0:${PORT}/mcp`);
-console.log(
-  `Providers: ${providers.map((p) => `${p.name}=${p.available() ? "ready" : "not configured"}`).join(", ")}`,
-);
+// Crash-proofing: a stray async error (e.g. from the fire-and-forget tool
+// pipeline that runs after the HTTP response is returned) must never terminate
+// the process. Log it and keep serving. This is what turns a one-request
+// failure into a survivable event instead of a full server drop.
+function installProcessGuards(): void {
+  process.on("unhandledRejection", (reason) => {
+    console.error("[unhandledRejection]", reason);
+  });
+  process.on("uncaughtException", (err) => {
+    console.error("[uncaughtException]", err);
+  });
+}
 
-process.on("SIGTERM", () => {
-  httpServer.stop();
-  process.exit(0);
-});
+// Only bind the port / install guards when run as the entrypoint, so tests can
+// import handleRequest without starting a real server.
+if (import.meta.main) {
+  installProcessGuards();
+
+  const httpServer = Bun.serve({
+    port: PORT,
+    hostname: "0.0.0.0",
+    fetch: handleRequest,
+  });
+
+  console.log(`mcp-flights v${VERSION} listening on http://0.0.0.0:${PORT}/mcp`);
+  console.log(
+    `Providers: ${providers.map((p) => `${p.name}=${p.available() ? "ready" : "not configured"}`).join(", ")}`,
+  );
+
+  process.on("SIGTERM", () => {
+    httpServer.stop();
+    process.exit(0);
+  });
+}

@@ -126,6 +126,21 @@ export function resolveProviderOrder(requestedSource: string): string[] {
 }
 
 // ============================================================
+// Stops mapping
+// ============================================================
+
+// Our tool's `maxStops` means "at most N stops" (0 = direct only). SerpAPI's
+// `stops` enum is DIFFERENT: 0 = any, 1 = nonstop, 2 = ≤1 stop, 3 = ≤2 stops.
+// Passing maxStops straight through (the old behavior) requested "nonstop only"
+// for maxStops=1, which returned zero results on routes with no direct flight.
+// Correct mapping is maxStops+1, except maxStops≥3 has no "≤3" enum value, so we
+// fall back to 0 (any) — a 3-stop itinerary is effectively unfiltered anyway.
+export function maxStopsToSerpStops(maxStops: number): number {
+  if (maxStops >= 3) return 0; // SerpAPI has no "≤3 stops" value; 0 = any
+  return maxStops + 1; // 0→1 (nonstop), 1→2 (≤1 stop), 2→3 (≤2 stops)
+}
+
+// ============================================================
 // SerpAPI query-string building (pure URL construction)
 // ============================================================
 
@@ -143,7 +158,7 @@ export function buildSerpApiQuery(params: FlightSearchParams, apiKey: string): U
 
   if (params.returnDate) qs.set("return_date", params.returnDate);
   if (params.travelClass) qs.set("travel_class", String(params.travelClass));
-  if (params.maxStops !== undefined) qs.set("stops", String(params.maxStops));
+  if (params.maxStops !== undefined) qs.set("stops", String(maxStopsToSerpStops(params.maxStops)));
 
   return qs;
 }
@@ -217,7 +232,14 @@ function formatResultRow(f: FlightResult, index: number): string | null {
   const airline = first.airline;
   const flightNo = first.flightNumber || "—";
   const dur = formatDuration(f.totalDuration);
-  const cls = first.travelClass || "Economy";
+  // Label the itinerary by its PRIMARY (longest) leg, not leg 0. A premium-economy
+  // fare often has an economy short-haul connector as its first leg; using
+  // first.travelClass mislabeled such itineraries as "Economy".
+  const primaryLeg = f.legs.reduce(
+    (longest, leg) => (leg.duration > longest.duration ? leg : longest),
+    first,
+  );
+  const cls = primaryLeg.travelClass || "Economy";
   const legroom = first.legroom || "—";
   const stopsLabel = f.stops === 0 ? "Direct" : `${f.stops} stop${f.stops > 1 ? "s" : ""}`;
   return `| ${index + 1} | ${route} | ${depart} | ${arrive} | ${airline} | ${flightNo} | ${dur} | ${stopsLabel} | ${cls} | ${f.price} ${f.currency} | ${legroom} |`;
